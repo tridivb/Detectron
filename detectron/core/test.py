@@ -62,7 +62,7 @@ def im_detect_all(model, im, box_proposals, timers=None):
     if cfg.TEST.BBOX_AUG.ENABLED:
         scores, boxes, im_scale = im_detect_bbox_aug(model, im, box_proposals)
     else:
-        scores, boxes, im_scale = im_detect_bbox(
+        scores, boxes, im_scale, features = im_detect_bbox(
             model, im, cfg.TEST.SCALE, cfg.TEST.MAX_SIZE, boxes=box_proposals
         )
     timers['im_detect_bbox'].toc()
@@ -72,7 +72,7 @@ def im_detect_all(model, im, box_proposals, timers=None):
     # cls_boxes boxes and scores are separated by class and in the format used
     # for evaluating results
     timers['misc_bbox'].tic()
-    scores, boxes, cls_boxes = box_results_with_nms_and_limit(scores, boxes)
+    scores, boxes, cls_boxes = box_results_with_nms_and_limit(scores, boxes, features)
     timers['misc_bbox'].toc()
 
     if cfg.MODEL.MASK_ON and boxes.shape[0] > 0:
@@ -162,9 +162,11 @@ def im_detect_bbox(model, im, target_scale, target_max_size, boxes=None):
         rois = workspace.FetchBlob(core.ScopedName('rois'))
         # unscale back to raw image space
         boxes = rois[:, 1:5] / im_scale
+        features = workspace.FetchBlob(core.ScopedName('fc7'))
 
     # Softmax class probabilities
     scores = workspace.FetchBlob(core.ScopedName('cls_prob')).squeeze()
+
     # In case there is 1 proposal
     scores = scores.reshape([-1, scores.shape[-1]])
 
@@ -191,7 +193,7 @@ def im_detect_bbox(model, im, target_scale, target_max_size, boxes=None):
         scores = scores[inv_index, :]
         pred_boxes = pred_boxes[inv_index, :]
 
-    return scores, pred_boxes, im_scale
+    return scores, pred_boxes, im_scale, features
 
 
 def im_detect_bbox_aug(model, im, box_proposals=None):
@@ -259,7 +261,7 @@ def im_detect_bbox_aug(model, im, box_proposals=None):
     # Compute detections for the original image (identity transform) last to
     # ensure that the Caffe2 workspace is populated with blobs corresponding
     # to the original image on return (postcondition of im_detect_bbox)
-    scores_i, boxes_i, im_scale_i = im_detect_bbox(
+    scores_i, boxes_i, im_scale_i, _ = im_detect_bbox(
         model, im, cfg.TEST.SCALE, cfg.TEST.MAX_SIZE, boxes=box_proposals
     )
     add_preds_t(scores_i, boxes_i)
@@ -306,7 +308,7 @@ def im_detect_bbox_hflip(
     else:
         box_proposals_hf = None
 
-    scores_hf, boxes_hf, im_scale = im_detect_bbox(
+    scores_hf, boxes_hf, im_scale, _ = im_detect_bbox(
         model, im_hf, target_scale, target_max_size, boxes=box_proposals_hf
     )
 
@@ -327,7 +329,7 @@ def im_detect_bbox_scale(
             model, im, target_scale, target_max_size, box_proposals=box_proposals
         )
     else:
-        scores_scl, boxes_scl, _ = im_detect_bbox(
+        scores_scl, boxes_scl, _, __ = im_detect_bbox(
             model, im, target_scale, target_max_size, boxes=box_proposals
         )
     return scores_scl, boxes_scl
@@ -356,7 +358,7 @@ def im_detect_bbox_aspect_ratio(
             box_proposals=box_proposals_ar
         )
     else:
-        scores_ar, boxes_ar, _ = im_detect_bbox(
+        scores_ar, boxes_ar, _, __ = im_detect_bbox(
             model,
             im_ar,
             cfg.TEST.SCALE,
@@ -746,7 +748,7 @@ def combine_heatmaps_size_dep(hms_ts, ds_ts, us_ts, boxes, heur_f):
     return hms_c
 
 
-def box_results_with_nms_and_limit(scores, boxes):
+def box_results_with_nms_and_limit(scores, boxes, features):
     """Returns bounding-box detection results by thresholding on scores and
     applying non-maximum suppression (NMS).
 
@@ -768,7 +770,8 @@ def box_results_with_nms_and_limit(scores, boxes):
         inds = np.where(scores[:, j] > cfg.TEST.SCORE_THRESH)[0]
         scores_j = scores[inds, j]
         boxes_j = boxes[inds, j * 4:(j + 1) * 4]
-        dets_j = np.hstack((boxes_j, scores_j[:, np.newaxis])).astype(
+        features_j = features[inds, :]
+        dets_j = np.hstack((boxes_j, scores_j[:, np.newaxis], features_j)).astype(
             np.float32, copy=False
         )
         if cfg.TEST.SOFT_NMS.ENABLED:
